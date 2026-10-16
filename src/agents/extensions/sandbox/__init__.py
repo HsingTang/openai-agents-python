@@ -111,6 +111,19 @@ try:
 except Exception:  # pragma: no cover
     _HAS_VERCEL = False
 
+try:
+    from .databricks import (
+        DEFAULT_DATABRICKS_WORKSPACE_ROOT as DEFAULT_DATABRICKS_WORKSPACE_ROOT,
+        DatabricksSandboxClient as DatabricksSandboxClient,
+        DatabricksSandboxClientOptions as DatabricksSandboxClientOptions,
+        DatabricksSandboxSession as DatabricksSandboxSession,
+        DatabricksSandboxSessionState as DatabricksSandboxSessionState,
+    )
+
+    _HAS_DATABRICKS = True
+except Exception:  # pragma: no cover
+    _HAS_DATABRICKS = False
+
 __all__: list[str] = []
 
 if _HAS_E2B:
@@ -209,5 +222,16 @@ if _HAS_RUNLOOP:
             "RunloopTimeouts",
             "RunloopTunnelConfig",
             "RunloopUserParameters",
+        ]
+    )
+
+if _HAS_DATABRICKS:
+    __all__.extend(
+        [
+            "DEFAULT_DATABRICKS_WORKSPACE_ROOT",
+            "DatabricksSandboxClient",
+            "DatabricksSandboxClientOptions",
+            "DatabricksSandboxSession",
+            "DatabricksSandboxSessionState",
         ]
     )
