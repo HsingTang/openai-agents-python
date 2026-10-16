@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import importlib
 import io
+import queue
 import sys
 import types
 import uuid
@@ -61,6 +62,12 @@ class _ExecuteCommandSyncResponse:
         self.truncated = truncated
 
 
+class _StreamMode:
+    PIPE = "pipe"
+    STDOUT = "stdout"
+    DEVNULL = "devnull"
+
+
 class _NotFound(Exception):
     pass
 
@@ -104,12 +111,17 @@ def mod(monkeypatch: pytest.MonkeyPatch) -> Any:
     fake_sandbox.Sandbox = _Placeholder
     fake_sandbox.SandboxSpec = _Placeholder
     fake_sandbox.SandboxState = _SandboxState
+    fake_mixins: Any = types.ModuleType("databricks.sdk.mixins")
+    fake_mixins_sandbox: Any = types.ModuleType("databricks.sdk.mixins.sandbox")
+    fake_mixins_sandbox.StreamMode = _StreamMode
 
     monkeypatch.setitem(sys.modules, "databricks", fake_databricks)
     monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
     monkeypatch.setitem(sys.modules, "databricks.sdk.errors", fake_errors)
     monkeypatch.setitem(sys.modules, "databricks.sdk.service", fake_service)
     monkeypatch.setitem(sys.modules, "databricks.sdk.service.sandbox", fake_sandbox)
+    monkeypatch.setitem(sys.modules, "databricks.sdk.mixins", fake_mixins)
+    monkeypatch.setitem(sys.modules, "databricks.sdk.mixins.sandbox", fake_mixins_sandbox)
     sys.modules.pop("agents.extensions.sandbox.databricks.sandbox", None)
     sys.modules.pop("agents.extensions.sandbox.databricks", None)
     return importlib.import_module("agents.extensions.sandbox.databricks.sandbox")
@@ -282,3 +294,155 @@ def test_session_state_round_trips_through_client(mod: Any) -> None:
     assert isinstance(restored, mod.DatabricksSandboxSessionState)
     assert restored.sandbox_id == "sb-42"
     assert restored.manifest.root == ROOT
+
+
+# -- interactive PTY (streaming execute_command) ----------------------------
+
+_EOF = object()
+
+
+class _FakeStdout:
+    """Queue-backed stdout whose read1 blocks like the SDK's CommandOutput."""
+
+    def __init__(self) -> None:
+        self._q: queue.Queue[object] = queue.Queue()
+
+    def feed(self, data: bytes) -> None:
+        self._q.put(data)
+
+    def feed_eof(self) -> None:
+        self._q.put(_EOF)
+
+    def read1(self, size: int = -1, *, timeout: float | None = None) -> bytes:
+        try:
+            item = self._q.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError from None
+        if item is _EOF:
+            self._q.put(_EOF)  # EOF is sticky
+            return b""
+        assert isinstance(item, bytes)
+        return item
+
+
+class _FakeStdin:
+    def __init__(self, stdout: _FakeStdout, *, echo_eof: bool = False) -> None:
+        self._stdout = stdout
+        self._echo_eof = echo_eof
+        self.writes: list[str] = []
+
+    def write(self, data: str) -> None:
+        self.writes.append(data)
+        payload = data.encode() if isinstance(data, str) else data
+        self._stdout.feed(b"echo:" + payload)
+        if self._echo_eof:
+            self._stdout.feed_eof()
+
+
+class _FakeCommandProcess:
+    def __init__(self, *, exit_code: int = 0, echo_eof: bool = False) -> None:
+        self.stdout = _FakeStdout()
+        self.stdin = _FakeStdin(self.stdout, echo_eof=echo_eof)
+        self._exit_code = exit_code
+        self.closed = False
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._exit_code
+
+    @property
+    def exit_code(self) -> int:
+        return self._exit_code
+
+    def close(self) -> None:
+        self.closed = True
+        self.stdout.feed_eof()
+
+
+class _FakePtySandboxApi:
+    def __init__(self, process: _FakeCommandProcess) -> None:
+        self._process = process
+        self.exec_calls: list[dict] = []
+
+    def execute_command(
+        self,
+        name: str,
+        cmd: str,
+        *,
+        args: list[str] | None = None,
+        envs: dict[str, str] | None = None,
+        text: bool = True,
+        stdout: Any = None,
+        stderr: Any = None,
+    ) -> _FakeCommandProcess:
+        self.exec_calls.append({"name": name, "cmd": cmd, "args": args, "envs": envs, "text": text})
+        return self._process
+
+
+class _FakePtyClient:
+    def __init__(self, process: _FakeCommandProcess) -> None:
+        self.sandbox = _FakePtySandboxApi(process)
+
+
+def _pty_session(mod: Any, process: _FakeCommandProcess) -> Any:
+    state = mod.DatabricksSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root=ROOT),
+        snapshot=resolve_snapshot(None, "sid"),
+        sandbox_id="sb1",
+    )
+    session = mod.DatabricksSandboxSession.from_state(state, client=_FakePtyClient(process))
+    session._provisioned = True
+    return session
+
+
+def test_supports_pty_true(mod: Any) -> None:
+    session = _pty_session(mod, _FakeCommandProcess())
+    assert session.supports_pty() is True
+
+
+async def test_pty_exec_start_runs_to_completion(mod: Any) -> None:
+    process = _FakeCommandProcess(exit_code=0)
+    process.stdout.feed(b"hello\n")
+    process.stdout.feed_eof()
+    session = _pty_session(mod, process)
+
+    update = await session.pty_exec_start("echo", "hello", yield_time_s=2)
+
+    assert b"hello" in update.output
+    assert update.exit_code == 0
+    assert update.process_id is None  # stream closed -> session deregistered
+    call = session._client.sandbox.exec_calls[0]
+    assert call["cmd"] == "/bin/bash"
+    assert call["args"][:3] == ["-lc", mod._CD_EXEC_SCRIPT, "/bin/bash"]
+    assert call["envs"] == {"DBX_CWD": ROOT}
+
+
+async def test_pty_write_stdin_sends_input_and_reads_echo(mod: Any) -> None:
+    process = _FakeCommandProcess(exit_code=0, echo_eof=True)
+    process.stdout.feed(b"prompt> ")
+    session = _pty_session(mod, process)
+
+    start = await session.pty_exec_start("bash", yield_time_s=0.3)
+    assert b"prompt> " in start.output
+    assert start.process_id is not None  # still open
+
+    update = await session.pty_write_stdin(
+        session_id=start.process_id, chars="ls\n", yield_time_s=1
+    )
+    assert process.stdin.writes == ["ls\n"]
+    assert b"echo:ls" in update.output
+    assert update.exit_code == 0
+    assert update.process_id is None  # echo_eof closed the stream
+
+
+async def test_pty_terminate_all_closes_processes(mod: Any) -> None:
+    process = _FakeCommandProcess()
+    process.stdout.feed(b"x")
+    session = _pty_session(mod, process)
+
+    start = await session.pty_exec_start("bash", yield_time_s=0.3)
+    assert start.process_id is not None
+
+    await session.pty_terminate_all()
+    assert process.closed is True
+    assert session._pty_sessions == {}

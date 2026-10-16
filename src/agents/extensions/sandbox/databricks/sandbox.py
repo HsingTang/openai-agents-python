@@ -31,11 +31,14 @@ import contextlib
 import io
 import time
 import uuid
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import NotFound
+from databricks.sdk.mixins.sandbox import StreamMode
 from databricks.sdk.service.sandbox import (
     ComputeSpec,
     ExecuteCommandStatus,
@@ -45,6 +48,7 @@ from databricks.sdk.service.sandbox import (
 )
 from google.protobuf.duration_pb2 import Duration
 
+from ....logger import logger
 from ....sandbox.errors import (
     ConfigurationError,
     ErrorCode,
@@ -61,6 +65,16 @@ from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
+from ....sandbox.session.pty_output import collect_pty_output
+from ....sandbox.session.pty_types import (
+    PTY_PROCESSES_MAX,
+    PTY_PROCESSES_WARNING,
+    PtyExecUpdate,
+    allocate_pty_process_id,
+    clamp_pty_yield_time_ms,
+    process_id_to_prune_from_meta,
+    resolve_pty_write_yield_time_ms,
+)
 from ....sandbox.session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
 from ....sandbox.snapshot import SnapshotBase, SnapshotSpec, resolve_snapshot
 from ....sandbox.types import ExecResult, User
@@ -98,6 +112,26 @@ _COMPLETED = ExecuteCommandStatus.EXECUTE_COMMAND_STATUS_COMPLETED
 _TIMED_OUT = ExecuteCommandStatus.EXECUTE_COMMAND_STATUS_TIMED_OUT
 _RUNNING = SandboxState.SANDBOX_STATE_RUNNING
 _STOPPED_STATES = (SandboxState.SANDBOX_STATE_STOPPED, SandboxState.SANDBOX_STATE_STOPPING)
+
+# Interactive PTY is served over the streaming execute_command RPC: a background
+# pump reads partial output (read1) into a buffer the shared yield-window collector
+# drains. The stream is pipe-based, not a real terminal (see supports_pty).
+_PTY_READ_CHUNK = 64 * 1024
+_PTY_READ_SLICE_S = 1.0
+_PTY_WAIT_TIMEOUT_S = 5.0
+
+
+@dataclass
+class _DatabricksPtySessionEntry:
+    process: Any
+    tty: bool = False
+    output_chunks: deque[bytes] = field(default_factory=deque)
+    output_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    output_notify: asyncio.Event = field(default_factory=asyncio.Event)
+    output_closed: asyncio.Event = field(default_factory=asyncio.Event)
+    last_used: float = field(default_factory=time.monotonic)
+    exit_code: int | None = None
+    worker_task: asyncio.Task[None] | None = None
 
 
 def _duration_or_none(timeout: float | None) -> Duration | None:
@@ -162,11 +196,17 @@ class DatabricksSandboxSession(BaseSandboxSession):
     state: DatabricksSandboxSessionState
     _client: WorkspaceClient
     _provisioned: bool
+    _pty_lock: asyncio.Lock
+    _pty_sessions: dict[int, _DatabricksPtySessionEntry]
+    _reserved_pty_process_ids: set[int]
 
     def __init__(self, *, state: DatabricksSandboxSessionState, client: WorkspaceClient) -> None:
         self.state = state
         self._client = client
         self._provisioned = False
+        self._pty_lock = asyncio.Lock()
+        self._pty_sessions = {}
+        self._reserved_pty_process_ids = set()
 
     @classmethod
     def from_state(
@@ -179,7 +219,7 @@ class DatabricksSandboxSession(BaseSandboxSession):
         return f"sandboxes/{self.state.sandbox_id}"
 
     def supports_pty(self) -> bool:
-        return False
+        return True
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -277,6 +317,238 @@ class DatabricksSandboxSession(BaseSandboxSession):
                 self._client.sandbox.stop_sandbox(self._name)
 
         await asyncio.to_thread(_stop)
+
+    # -- interactive PTY (streaming execute_command) -------------------------
+
+    async def pty_exec_start(
+        self,
+        *command: str | Path,
+        timeout: float | None = None,
+        shell: bool | list[str] = True,
+        user: str | User | None = None,
+        tty: bool = False,
+        yield_time_s: float | None = None,
+        max_output_tokens: int | None = None,
+    ) -> PtyExecUpdate:
+        if user is not None:
+            self._reject_user_arg("exec", user)
+        await self._ensure_sandbox()
+        sanitized = self._prepare_exec_command(*command, shell=shell, user=None)
+        argv = [str(part) for part in sanitized]
+        args = ["-lc", _CD_EXEC_SCRIPT, _SHELL, *argv]
+
+        def _start() -> Any:
+            return self._client.sandbox.execute_command(
+                self._name,
+                _SHELL,
+                args=args,
+                envs={"DBX_CWD": self.state.manifest.root},
+                text=False,
+                stdout=StreamMode.PIPE,
+                stderr=StreamMode.STDOUT,
+            )
+
+        try:
+            process = await asyncio.to_thread(_start)
+        except Exception as exc:
+            raise ExecTransportError(
+                command=argv,
+                context={"backend": "databricks", "sandbox_id": self.state.sandbox_id},
+                cause=exc,
+            ) from exc
+
+        entry = _DatabricksPtySessionEntry(process=process, tty=tty)
+        entry.worker_task = asyncio.create_task(self._pump_output(entry))
+
+        async with self._pty_lock:
+            process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
+            self._reserved_pty_process_ids.add(process_id)
+            pruned = self._prune_pty_sessions_if_needed()
+            self._pty_sessions[process_id] = entry
+            process_count = len(self._pty_sessions)
+
+        if pruned is not None:
+            await self._terminate_pty_entry(pruned)
+        if process_count >= PTY_PROCESSES_WARNING:
+            logger.warning(
+                "PTY process count reached warning threshold: %s active sessions",
+                process_count,
+            )
+
+        yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
+        output, original_token_count, output_closed = await self._collect_pty_output(
+            entry=entry,
+            yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
+            max_output_tokens=max_output_tokens,
+        )
+        return await self._finalize_pty_update(
+            process_id=process_id,
+            entry=entry,
+            output=output,
+            original_token_count=original_token_count,
+            output_closed=output_closed,
+        )
+
+    async def _pump_output(self, entry: _DatabricksPtySessionEntry) -> None:
+        """Drain the command's combined stdout/stderr stream into the entry buffer."""
+        stdout = entry.process.stdout
+
+        def _read_slice() -> bytes | None:
+            # read1 returns bytes as they arrive, b"" at EOF, or raises TimeoutError
+            # when the command is idle; map the idle case to None so we keep polling.
+            try:
+                chunk = stdout.read1(_PTY_READ_CHUNK, timeout=_PTY_READ_SLICE_S)
+            except TimeoutError:
+                return None
+            return bytes(chunk)
+
+        try:
+            while True:
+                chunk = await asyncio.to_thread(_read_slice)
+                if chunk is None:
+                    continue
+                if not chunk:
+                    break
+                async with entry.output_lock:
+                    entry.output_chunks.append(chunk)
+                entry.output_notify.set()
+        except Exception:
+            pass
+        finally:
+
+            def _wait() -> int | None:
+                try:
+                    return int(entry.process.wait(timeout=_PTY_WAIT_TIMEOUT_S))
+                except Exception:
+                    return None
+
+            exit_code = await asyncio.to_thread(_wait)
+            if exit_code is not None:
+                entry.exit_code = int(exit_code)
+            entry.output_closed.set()
+            entry.output_notify.set()
+
+    async def pty_write_stdin(
+        self,
+        *,
+        session_id: int,
+        chars: str,
+        yield_time_s: float | None = None,
+        max_output_tokens: int | None = None,
+    ) -> PtyExecUpdate:
+        async with self._pty_lock:
+            entry = self._resolve_pty_session_entry(
+                pty_processes=self._pty_sessions,
+                session_id=session_id,
+            )
+
+        if chars and not entry.output_closed.is_set():
+
+            def _write() -> None:
+                entry.process.stdin.write(chars)
+
+            try:
+                await asyncio.to_thread(_write)
+            except Exception as exc:
+                raise ExecTransportError(
+                    command=[],
+                    context={"backend": "databricks", "sandbox_id": self.state.sandbox_id},
+                    cause=exc,
+                ) from exc
+
+        yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
+        output, original_token_count, output_closed = await self._collect_pty_output(
+            entry=entry,
+            yield_time_ms=resolve_pty_write_yield_time_ms(
+                yield_time_ms=yield_time_ms, input_empty=chars == ""
+            ),
+            max_output_tokens=max_output_tokens,
+        )
+        entry.last_used = time.monotonic()
+        return await self._finalize_pty_update(
+            process_id=session_id,
+            entry=entry,
+            output=output,
+            original_token_count=original_token_count,
+            output_closed=output_closed,
+        )
+
+    async def pty_terminate_all(self) -> None:
+        async with self._pty_lock:
+            entries = list(self._pty_sessions.values())
+            self._pty_sessions.clear()
+            self._reserved_pty_process_ids.clear()
+        for entry in entries:
+            await self._terminate_pty_entry(entry)
+
+    async def _collect_pty_output(
+        self,
+        *,
+        entry: _DatabricksPtySessionEntry,
+        yield_time_ms: int,
+        max_output_tokens: int | None,
+    ) -> tuple[bytes, int | None, bool]:
+        return await collect_pty_output(
+            output_chunks=entry.output_chunks,
+            output_lock=entry.output_lock,
+            output_notify=entry.output_notify,
+            is_done=entry.output_closed.is_set,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+        )
+
+    async def _finalize_pty_update(
+        self,
+        *,
+        process_id: int,
+        entry: _DatabricksPtySessionEntry,
+        output: bytes,
+        original_token_count: int | None,
+        output_closed: bool,
+    ) -> PtyExecUpdate:
+        exit_code = entry.exit_code if output_closed else None
+        live_process_id: int | None = process_id
+
+        if output_closed:
+            async with self._pty_lock:
+                removed = self._pty_sessions.pop(process_id, None)
+                self._reserved_pty_process_ids.discard(process_id)
+            if removed is not None:
+                await self._terminate_pty_entry(removed)
+            live_process_id = None
+
+        return PtyExecUpdate(
+            process_id=live_process_id,
+            output=output,
+            exit_code=exit_code,
+            original_token_count=original_token_count,
+        )
+
+    def _prune_pty_sessions_if_needed(self) -> _DatabricksPtySessionEntry | None:
+        if len(self._pty_sessions) < PTY_PROCESSES_MAX:
+            return None
+        meta: list[tuple[int, float, bool]] = [
+            (pid, entry.last_used, entry.output_closed.is_set())
+            for pid, entry in self._pty_sessions.items()
+        ]
+        pid = process_id_to_prune_from_meta(meta)
+        if pid is None:
+            return None
+        self._reserved_pty_process_ids.discard(pid)
+        return self._pty_sessions.pop(pid, None)
+
+    async def _terminate_pty_entry(self, entry: _DatabricksPtySessionEntry) -> None:
+        def _close() -> None:
+            with contextlib.suppress(Exception):
+                entry.process.close()
+
+        await asyncio.to_thread(_close)
+        worker_task = entry.worker_task
+        entry.worker_task = None
+        if worker_task is not None and worker_task is not asyncio.current_task():
+            if not worker_task.done():
+                worker_task.cancel()
+            await asyncio.gather(worker_task, return_exceptions=True)
 
     # -- command execution ---------------------------------------------------
 
