@@ -224,3 +224,15 @@ For more runnable examples, browse [examples/sandbox/](https://github.com/openai
 ## External providers
 
 Applications can supply a sandbox client from a separately installed package through `SandboxRunConfig(client=...)`. See [Build a sandbox provider](custom-providers.md) for the authoring contract and a runnable external-package example.
+
+### Community-maintained providers
+
+These sandbox clients are maintained outside this repository and published as their own packages. Install the package, then pass the client to `SandboxRunConfig(client=...)`; the `SandboxAgent` definition stays the same.
+
+<div class="sandbox-nowrap-first-column-table" markdown="1">
+
+| Provider | Install | Client | Links |
+| --- | --- | --- | --- |
+| Databricks | `databricks-openai[sandbox]` | `DatabricksSandboxClient` | [PyPI](https://pypi.org/project/databricks-openai/) / [Source](https://github.com/databricks/databricks-ai-bridge/tree/main/integrations/openai) |
+
+</div>
