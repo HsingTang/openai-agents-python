@@ -25,6 +25,14 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 
+[project.optional-dependencies]
+databricks = [
+    "databricks-sdk[sandbox]>=0.153.0",
+    "websockets>=13",
+    "cryptography>=42",
+    "certifi",
+]
+
 [project.urls]
 Homepage = "https://github.com/openai/openai-agents-python/tree/feat/codex-harness"
 Repository = "https://github.com/openai/openai-agents-python"
@@ -139,6 +147,10 @@ strict = true
 disallow_incomplete_defs = false
 disallow_untyped_defs = false
 disallow_untyped_calls = false
+
+[[tool.mypy.overrides]]
+module = ["databricks.*"]
+ignore_missing_imports = true
 
 [tool.coverage.run]
 source = ["src/agents"]
