@@ -1,0 +1,4 @@
+databricks-sdk[sandbox]>=0.153.0
+websockets>=13
+cryptography>=42
+certifi
