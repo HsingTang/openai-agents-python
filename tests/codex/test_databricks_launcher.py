@@ -2,12 +2,12 @@
 
 Cover the startup-banner filter in ``_forward_stdout``: the launcher must drop
 ``codex``'s non-JSON startup preamble, then forward every exec-server protocol
-line verbatim. Run from the repo root with the example requirements installed.
+line verbatim. Run from the repo root with the preview wheel installed.
 """
 
 from __future__ import annotations
 
-from examples.codex.databricks.launch import _forward_stdout
+from _agents_codex._databricks_launcher import _forward_stdout
 
 
 def _run(lines: list[bytes]) -> list[bytes]:
@@ -38,7 +38,6 @@ def test_drops_banner_then_forwards_protocol() -> None:
 
 
 def test_forwards_everything_after_protocol_starts() -> None:
-    # A non-JSON line after the protocol has started is still forwarded.
     written = _run([b'{"a":1}\n', b"not-json-but-mid-stream\n", b'{"b":2}\n'])
     assert written == [b'{"a":1}\n', b"not-json-but-mid-stream\n", b'{"b":2}\n']
 

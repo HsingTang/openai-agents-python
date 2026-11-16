@@ -103,6 +103,7 @@ from agents.classic.sandbox.session.sinks import (
     WorkspaceJsonlSink as WorkspaceJsonlSink,
 )
 
+from ._databricks import DatabricksStdioEnvironment
 from ._function_tools import FunctionTool
 from ._managed_workspace import (
     _SANDBOX_CAPABILITIES_ATTRIBUTE,
@@ -1221,6 +1222,7 @@ def _render_workspace_instructions(manifest: Manifest, environment: Environment[
 
 
 __all__ = [
+    "DatabricksStdioEnvironment",
     "DockerGateway",
     "Instrumentation",
     "EventPayloadPolicy",

@@ -1,17 +1,16 @@
-"""Tests for the Databricks sandbox stdio environment example.
+"""Tests for the Databricks sandbox stdio environment (``agents.sandbox``).
 
-Cover the ``DatabricksStdioEnvironment`` subclass (native ``stdio_command``
-emission and url/header validation) and the ``databricks_sandbox_environment``
-factory (running precondition, name normalization, credential derivation, and
-launcher argv/env wiring). Run from the repo root with the preview wheel and
-``examples/codex/databricks/requirements.txt`` installed.
+Cover ``DatabricksStdioEnvironment`` (native ``stdio_command`` emission and
+url/header validation) and its ``for_sandbox`` constructor (running precondition,
+name normalization, credential derivation, and launcher argv/env wiring). Run
+from the repo root with the preview wheel installed.
 """
 
 from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 import pytest
 
@@ -19,14 +18,8 @@ pytest.importorskip("databricks.sdk")
 
 from databricks.sdk.service.sandbox import SandboxState
 
-from examples.codex.databricks.environment import (
-    _LAUNCHER,
-    DatabricksStdioEnvironment,
-    databricks_sandbox_environment,
-)
-
-if TYPE_CHECKING:
-    from databricks.sdk import WorkspaceClient
+from _agents_codex._databricks import _LAUNCHER
+from agents.sandbox import DatabricksStdioEnvironment
 
 
 class _FakeSandbox:
@@ -50,27 +43,22 @@ class _FakeWorkspaceClient:
         self.config = _FakeConfig()
 
 
-def _client(state: Any = SandboxState.SANDBOX_STATE_RUNNING) -> WorkspaceClient:
-    return cast("WorkspaceClient", _FakeWorkspaceClient(state))
-
-
 def test_to_native_emits_stdio_command() -> None:
     environment = DatabricksStdioEnvironment(
         url="stdio://databricks/sbx",
         cwd="/home/sandbox-agent/work",
         tools=("exec_command", "write_stdin", "apply_patch"),
         headers={},
-        _argv=("/usr/bin/python", "/pkg/launch.py", "sandboxes/sbx"),
+        _argv=("/usr/bin/python", "/pkg/_databricks_launcher.py", "sandboxes/sbx"),
         _launch_env={"DATABRICKS_HOST": "https://h", "DATABRICKS_TOKEN": "t"},
     )
     native = environment._to_native()
     assert native["stdio_command"] == {
         "program": "/usr/bin/python",
-        "args": ["/pkg/launch.py", "sandboxes/sbx"],
+        "args": ["/pkg/_databricks_launcher.py", "sandboxes/sbx"],
         "env": {"DATABRICKS_HOST": "https://h", "DATABRICKS_TOKEN": "t"},
         "cwd": None,
     }
-    # The stdio url is carried through; the runtime admits it as a host-owned source.
     assert native["url"] == "stdio://databricks/sbx"
 
 
@@ -94,18 +82,18 @@ def test_rejects_headers() -> None:
         )
 
 
-def test_factory_rejects_non_running_sandbox() -> None:
+def test_for_sandbox_rejects_non_running() -> None:
     with pytest.raises(RuntimeError, match="not running"):
-        databricks_sandbox_environment(
-            workspace_client=_client(SandboxState.SANDBOX_STATE_STOPPED),
+        DatabricksStdioEnvironment.for_sandbox(
+            workspace_client=_FakeWorkspaceClient(SandboxState.SANDBOX_STATE_STOPPED),
             sandbox_name="sbx",
             cwd="/w",
         )
 
 
-def test_factory_wires_launcher_and_credentials() -> None:
-    environment = databricks_sandbox_environment(
-        workspace_client=_client(),
+def test_for_sandbox_wires_launcher_and_credentials() -> None:
+    environment = DatabricksStdioEnvironment.for_sandbox(
+        workspace_client=_FakeWorkspaceClient(),
         sandbox_name="sbx",
         cwd="/home/sandbox-agent/work",
     )
@@ -113,18 +101,16 @@ def test_factory_wires_launcher_and_credentials() -> None:
     assert environment.cwd == "/home/sandbox-agent/work"
     assert dict(environment.headers) == {}
     assert tuple(environment.tools) == ("exec_command", "write_stdin", "apply_patch")
-    # Name normalized to the resource form and passed to the launcher.
     assert environment._argv == (sys.executable, str(_LAUNCHER), "sandboxes/sbx")
-    # Host trailing slash stripped; token derived from the profile (no OpenAI key).
     assert environment._launch_env == {
         "DATABRICKS_HOST": "https://my-host.example.com",
         "DATABRICKS_TOKEN": "tok-abc",
     }
 
 
-def test_factory_accepts_resource_name() -> None:
-    environment = databricks_sandbox_environment(
-        workspace_client=_client(),
+def test_for_sandbox_accepts_resource_name() -> None:
+    environment = DatabricksStdioEnvironment.for_sandbox(
+        workspace_client=_FakeWorkspaceClient(),
         sandbox_name="sandboxes/sbx",
         cwd="/w",
     )

@@ -1,15 +1,16 @@
 """Launcher the native runtime spawns to bridge executor stdio to a sandbox.
 
-``DatabricksStdioEnvironment`` declares this script as a host-owned
+:class:`DatabricksStdioEnvironment` declares this file as a host-owned
 ``stdio_command``. The native runtime starts it and speaks the exec-server wire
 protocol over its stdin/stdout. This launcher relays that protocol to
 ``codex exec-server --listen stdio`` running in the Databricks sandbox, over the
 ``databricks-sdk`` streaming command API (``WorkspaceClient.sandbox.execute_command``,
 whose ``CommandProcess`` exposes the command's stdin, stdout and exit).
 
-Spawned as ``python launch.py <sandboxes/ID>`` with ``DATABRICKS_HOST`` and
-``DATABRICKS_TOKEN`` in the environment (set by ``databricks_sandbox_environment``).
-Diagnostics go to stderr so stdout stays a clean protocol channel.
+It is run as a standalone script - ``python _databricks_launcher.py <sandboxes/ID>``
+with ``DATABRICKS_HOST`` and ``DATABRICKS_TOKEN`` in the environment - so it does
+not import the ``_agents_codex`` package or the native runtime. Diagnostics go to
+stderr so stdout stays a clean protocol channel.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ def main() -> int:
     host = os.environ.get("DATABRICKS_HOST")
     token = os.environ.get("DATABRICKS_TOKEN")
     if not host or not token:
-        print("launch.py requires DATABRICKS_HOST and DATABRICKS_TOKEN", file=sys.stderr)
+        print("launcher requires DATABRICKS_HOST and DATABRICKS_TOKEN", file=sys.stderr)
         return 2
 
     from databricks.sdk import WorkspaceClient

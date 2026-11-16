@@ -3,33 +3,33 @@
 Back a native `Environment` with a Databricks sandbox, so an agent driven by
 this SDK runs `exec_command` / `write_stdin` / `apply_patch` inside the sandbox.
 This is the "remote execution" pattern from `docs/sdk/execution.md`, built the
-same way the SDK's own Docker support is: an `Environment` subclass declares a
-host-owned `stdio_command` that the native runtime spawns, and the runtime
-speaks the exec-server protocol over that process's stdin/stdout. It is the
-Databricks counterpart of `agents.sandbox.DockerGateway` /
-`examples/codex/offline_docker.py`.
+same way the SDK's own Docker support is: `agents.sandbox.DatabricksStdioEnvironment`
+is an `Environment` subclass that declares a host-owned `stdio_command` the
+native runtime spawns, and the runtime speaks the exec-server protocol over that
+process's stdin/stdout. It is the Databricks counterpart of
+`agents.sandbox.DockerGateway`.
 
 > **Status.** The stdio transport and the full turn are validated end-to-end
 > against a live Databricks sandbox on the `0.24.0-alpha.8` preview wheel: a real
 > `codex exec-server` ran the agent's tool call in the sandbox with no gateway
 > server and no TLS, driven over the `databricks-sdk` streaming command API, for
 > both model providers (Databricks AI Gateway and OpenAI direct). The `stdio://`
-> executor source this example uses requires an Agents SDK build that includes
-> the host-owned stdio admission change in this PR's native runtime
-> (`packages/codex/rust/environment.rs`); it is not yet in a released preview
-> wheel. Until it ships, build the SDK from this branch (see
+> executor source requires the host-owned stdio admission change in this PR's
+> native runtime (`packages/codex/rust/environment.rs`); it is not yet in a
+> released preview wheel. Until it ships, build the SDK from this branch (see
 > `packages/codex/MAINTAINING.md`). The Python pieces are covered by
 > `tests/codex/` against the released wheel.
 
 ## How it works
 
-`DatabricksStdioEnvironment` (`environment.py`) subclasses the native
-`Environment` and emits a `stdio_command`: the argv of a local launcher process.
-When the session opens, the native runtime spawns that launcher and speaks the
-exec-server wire protocol over its stdin/stdout. The launcher (`launch.py`)
-relays that protocol to `codex exec-server --listen stdio` inside the sandbox
-over the `databricks-sdk` streaming command API
-(`WorkspaceClient.sandbox.execute_command`, whose `CommandProcess` exposes the
+`DatabricksStdioEnvironment.for_sandbox(...)` confirms the sandbox is running,
+derives the workspace host and token from the `WorkspaceClient`, and returns an
+environment to hand to `agent.session(environment=...)`. The environment emits a
+`stdio_command`: the argv of a local launcher process. When the session opens,
+the native runtime spawns that launcher and speaks the exec-server wire protocol
+over its stdin/stdout. The launcher relays that protocol to `codex exec-server
+--listen stdio` inside the sandbox over the `databricks-sdk` streaming command
+API (`WorkspaceClient.sandbox.execute_command`, whose `CommandProcess` exposes the
 command's `stdin`, `stdout` and exit). It does not parse the protocol; it only
 drops a startup banner the sandbox's `codex` prints on stdout before the protocol
 begins (non-JSON lines) so it never reaches the runtime as a bogus message.
@@ -41,22 +41,10 @@ control plane, so the sandbox needs no inbound ingress. The agent loop runs in
 your process (via `NativeProvider`), which is what makes the `Environment`
 approval / transform callbacks and `NetworkPolicy` available.
 
-`databricks_sandbox_environment` (`environment.py`) confirms the sandbox is
-running, derives the workspace host and token from the `WorkspaceClient`, and
-returns a configured `DatabricksStdioEnvironment` to hand to
-`agent.session(environment=...)`.
-
-> This subclass overrides `Environment._to_native` and `_validate_remote_url`,
-> which are preview internals and can change across SDK builds. It mirrors the
-> SDK's own `_DockerStdioEnvironment`.
-
 ## Files
 
-- `environment.py` - `DatabricksStdioEnvironment` and the
-  `databricks_sandbox_environment` factory.
-- `launch.py` - the launcher the native runtime spawns to bridge stdio to the
-  sandbox.
-- `runner.py` - a runnable end-to-end example.
+- `runner.py` - a runnable end-to-end example. The environment itself is the
+  first-class `agents.sandbox.DatabricksStdioEnvironment`.
 
 ## Install and run
 
@@ -104,7 +92,7 @@ Only the model provider changes; the sandbox, launcher, and tools are identical.
    starts it if stopped, and polls its status until running before opening the
    environment - the exec-server is reached through `execute_command`, which
    needs a running sandbox. `runner.py` shows this, and
-   `databricks_sandbox_environment` confirms it.
+   `DatabricksStdioEnvironment.for_sandbox` confirms it.
 2. **exec-server stdio mode in the image.** The sandbox's `codex` runs the
    standalone exec-server over stdio with `codex exec-server --listen stdio`,
    which the launcher relays.
@@ -116,10 +104,11 @@ Only the model provider changes; the sandbox, launcher, and tools are identical.
 `tests/codex/test_databricks_environment.py` and `test_databricks_launcher.py`
 cover the `stdio_command` emission, the `stdio://` / header validation, the
 factory's running-sandbox precondition, name normalization, and credential and
-launcher-argv wiring, plus the launcher's startup-banner filter. These run
-against the released preview wheel (they do not need the native admission change
-or a live sandbox). Install the preview wheel, this example's requirements, and
-`pytest`, then run them explicitly from the repo root (the default `testpaths`
+launcher-argv wiring, plus the launcher's startup-banner filter. They exercise
+only the Python layer (not the native admission or a live sandbox), but they
+import the packaged class, so run them against an SDK built from this branch.
+Install that wheel, this example's requirements, and `pytest`, then run them
+explicitly from the repo root (the default `testpaths`
 does not include `tests/codex`):
 
 ```sh

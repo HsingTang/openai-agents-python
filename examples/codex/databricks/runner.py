@@ -20,11 +20,11 @@ Environment variables:
 
 With SANDBOX_CREATE=1 the runner provisions the sandbox. In all cases it then
 confirms the sandbox is running (starting it if stopped and polling until ready)
-and ensures the workspace directory exists before building
-``databricks_sandbox_environment``. When the session opens, the native runtime
-spawns the launcher, which reaches the exec-server through ``execute_command``
-(needs a running sandbox); no separate exec-server start is needed here. A
-sandbox that auto-stops is started again before the next session.
+and ensures the workspace directory exists before building the environment with
+``DatabricksStdioEnvironment.for_sandbox``. When the session opens, the native
+runtime spawns the launcher, which reaches the exec-server through
+``execute_command`` (needs a running sandbox); no separate exec-server start is
+needed here. A sandbox that auto-stops is started again before the next session.
 
 By default the model runs through the sandbox workspace's Databricks AI Gateway
 codex endpoint, authenticated with the profile's own token (PAT or OAuth), so no
@@ -44,7 +44,7 @@ import time
 from databricks.sdk import WorkspaceClient
 
 from agents import Agent, NativeProvider
-from examples.codex.databricks.environment import databricks_sandbox_environment
+from agents.sandbox import DatabricksStdioEnvironment
 
 
 def _resource_name(name: str) -> str:
@@ -132,7 +132,7 @@ async def main(task: str) -> None:
         sandbox_name, "/bin/bash", args=["-lc", f"mkdir -p {cwd}"]
     )
 
-    environment = databricks_sandbox_environment(
+    environment = DatabricksStdioEnvironment.for_sandbox(
         workspace_client=workspace_client,
         sandbox_name=sandbox_name,
         cwd=cwd,
