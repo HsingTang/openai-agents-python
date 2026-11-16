@@ -20,11 +20,11 @@ Environment variables:
 
 With SANDBOX_CREATE=1 the runner provisions the sandbox. In all cases it then
 confirms the sandbox is running (starting it if stopped and polling until ready)
-and ensures the workspace directory exists before opening
-``databricks_sandbox_environment`` - the gateway reaches the exec-server through
-``execute_command``, which needs a running sandbox. The gateway launches
-``exec-server stdio`` on each connection, so no separate exec-server start is
-needed here; a sandbox that auto-stops is started again before the next session.
+and ensures the workspace directory exists before building
+``databricks_sandbox_environment``. When the session opens, the native runtime
+spawns the launcher, which reaches the exec-server through ``execute_command``
+(needs a running sandbox); no separate exec-server start is needed here. A
+sandbox that auto-stops is started again before the next session.
 
 By default the model runs through the sandbox workspace's Databricks AI Gateway
 codex endpoint, authenticated with the profile's own token (PAT or OAuth), so no
@@ -132,25 +132,25 @@ async def main(task: str) -> None:
         sandbox_name, "/bin/bash", args=["-lc", f"mkdir -p {cwd}"]
     )
 
-    base_url, api_key = _model_credentials(workspace_client)
-    async with databricks_sandbox_environment(
+    environment = databricks_sandbox_environment(
         workspace_client=workspace_client,
         sandbox_name=sandbox_name,
         cwd=cwd,
-    ) as environment:
-        async with NativeProvider(
-            base_url=base_url,
-            api_key=api_key,
-            supports_websockets=False,
-        ) as provider:
-            agent = Agent(
-                instructions="Inspect the assigned workspace and report findings.",
-                model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
-                provider=provider,
-            )
-            async with agent.session(environment=environment) as session:
-                result = await (await session.submit(task)).get_result()
-                print(result.final_output)
+    )
+    base_url, api_key = _model_credentials(workspace_client)
+    async with NativeProvider(
+        base_url=base_url,
+        api_key=api_key,
+        supports_websockets=False,
+    ) as provider:
+        agent = Agent(
+            instructions="Inspect the assigned workspace and report findings.",
+            model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
+            provider=provider,
+        )
+        async with agent.session(environment=environment) as session:
+            result = await (await session.submit(task)).get_result()
+            print(result.final_output)
 
 
 if __name__ == "__main__":

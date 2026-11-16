@@ -1,237 +1,132 @@
-"""Tests for the Databricks sandbox environment example context manager.
+"""Tests for the Databricks sandbox stdio environment example.
 
-Cover the public entry point (Environment wiring, teardown, trust handling) and
-the ``SSL_CERT_FILE`` bundle helper. Run from the repo root with the preview
-wheel and ``examples/codex/databricks/requirements.txt`` installed.
+Cover the ``DatabricksStdioEnvironment`` subclass (native ``stdio_command``
+emission and url/header validation) and the ``databricks_sandbox_environment``
+factory (running precondition, name normalization, credential derivation, and
+launcher argv/env wiring). Run from the repo root with the preview wheel and
+``examples/codex/databricks/requirements.txt`` installed.
 """
 
 from __future__ import annotations
 
-import os
-import queue
-import ssl
-from pathlib import Path
+import sys
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-pytest.importorskip("websockets")
-pytest.importorskip("cryptography")
-pytest.importorskip("certifi")
+pytest.importorskip("databricks.sdk")
 
-from databricks.sdk.service.sandbox import SandboxState  # noqa: E402
-from websockets.asyncio.client import connect  # noqa: E402
+from databricks.sdk.service.sandbox import SandboxState
 
-from examples.codex.databricks.environment import (  # noqa: E402
-    _install_trust_bundle,
+from examples.codex.databricks.environment import (
+    _LAUNCHER,
+    DatabricksStdioEnvironment,
     databricks_sandbox_environment,
 )
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
-_FAKE_CA = b"-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
-
-
-class _FakeStdin:
-    def __init__(self) -> None:
-        self.written = bytearray()
-
-    def write(self, data: bytes) -> None:
-        self.written.extend(data)
-
-    def flush(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
-
-
-class _FakeStdout:
-    def __init__(self) -> None:
-        self._lines: queue.Queue[bytes | None] = queue.Queue()
-
-    def eof(self) -> None:
-        self._lines.put(None)
-
-    def readline(self) -> bytes:
-        item = self._lines.get()
-        return b"" if item is None else item
-
-
-class _FakeProcess:
-    def __init__(self) -> None:
-        self.stdin = _FakeStdin()
-        self.stdout = _FakeStdout()
-
-    def close(self) -> None:
-        self.stdout.eof()
-
 
 class _FakeSandbox:
-    def __init__(self, proc: _FakeProcess, state: Any = None) -> None:
-        self._proc = proc
-        self._state = state if state is not None else SandboxState.SANDBOX_STATE_RUNNING
+    def __init__(self, state: Any) -> None:
+        self._state = state
 
     def get_sandbox(self, name: str) -> SimpleNamespace:
         return SimpleNamespace(status=SimpleNamespace(state=self._state))
 
-    def execute_command(
-        self,
-        name: str,
-        program: str,
-        args: list[str],
-        text: bool,
-        envs: dict[str, str] | None = None,
-    ) -> _FakeProcess:
-        return self._proc
+
+class _FakeConfig:
+    host = "https://my-host.example.com/"
+
+    def authenticate(self) -> dict[str, str]:
+        return {"Authorization": "Bearer tok-abc"}
 
 
 class _FakeWorkspaceClient:
-    def __init__(self, proc: _FakeProcess, state: Any = None) -> None:
-        self.sandbox = _FakeSandbox(proc, state)
+    def __init__(self, state: Any = SandboxState.SANDBOX_STATE_RUNNING) -> None:
+        self.sandbox = _FakeSandbox(state)
+        self.config = _FakeConfig()
 
 
-async def test_rejects_non_running_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    client = _FakeWorkspaceClient(_FakeProcess(), SandboxState.SANDBOX_STATE_STOPPED)
+def _client(state: Any = SandboxState.SANDBOX_STATE_RUNNING) -> WorkspaceClient:
+    return cast("WorkspaceClient", _FakeWorkspaceClient(state))
+
+
+def test_to_native_emits_stdio_command() -> None:
+    environment = DatabricksStdioEnvironment(
+        url="stdio://databricks/sbx",
+        cwd="/home/sandbox-agent/work",
+        tools=("exec_command", "write_stdin", "apply_patch"),
+        headers={},
+        _argv=("/usr/bin/python", "/pkg/launch.py", "sandboxes/sbx"),
+        _launch_env={"DATABRICKS_HOST": "https://h", "DATABRICKS_TOKEN": "t"},
+    )
+    native = environment._to_native()
+    assert native["stdio_command"] == {
+        "program": "/usr/bin/python",
+        "args": ["/pkg/launch.py", "sandboxes/sbx"],
+        "env": {"DATABRICKS_HOST": "https://h", "DATABRICKS_TOKEN": "t"},
+        "cwd": None,
+    }
+    # The stdio url is carried through; the runtime admits it as a host-owned source.
+    assert native["url"] == "stdio://databricks/sbx"
+
+
+def test_rejects_non_stdio_url() -> None:
+    with pytest.raises(ValueError, match="stdio://"):
+        DatabricksStdioEnvironment(
+            url="wss://127.0.0.1:9000",
+            cwd="/w",
+            headers={},
+            _argv=("python", "launch.py", "sandboxes/sbx"),
+        )
+
+
+def test_rejects_headers() -> None:
+    with pytest.raises(ValueError, match="no headers"):
+        DatabricksStdioEnvironment(
+            url="stdio://databricks/sbx",
+            cwd="/w",
+            headers={"Authorization": "Bearer x"},
+            _argv=("python", "launch.py", "sandboxes/sbx"),
+        )
+
+
+def test_factory_rejects_non_running_sandbox() -> None:
     with pytest.raises(RuntimeError, match="not running"):
-        async with databricks_sandbox_environment(
-            workspace_client=cast("WorkspaceClient", client),
+        databricks_sandbox_environment(
+            workspace_client=_client(SandboxState.SANDBOX_STATE_STOPPED),
             sandbox_name="sbx",
             cwd="/w",
-            token="t",
-        ):
-            pass
-    assert "SSL_CERT_FILE" not in os.environ
+        )
 
 
-async def test_environment_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    client = _FakeWorkspaceClient(_FakeProcess())
-    async with databricks_sandbox_environment(
-        workspace_client=cast("WorkspaceClient", client),
+def test_factory_wires_launcher_and_credentials() -> None:
+    environment = databricks_sandbox_environment(
+        workspace_client=_client(),
         sandbox_name="sbx",
         cwd="/home/sandbox-agent/work",
-        token="tok-123",
-    ) as environment:
-        assert environment.url.startswith("wss://127.0.0.1:")
-        assert environment.cwd == "/home/sandbox-agent/work"
-        # Environment lowercases header names.
-        assert environment.headers["authorization"] == "Bearer tok-123"
-        assert tuple(environment.tools) == ("exec_command", "write_stdin", "apply_patch")
-        assert "SSL_CERT_FILE" in os.environ
-    assert "SSL_CERT_FILE" not in os.environ
+    )
+    assert environment.url == "stdio://databricks/sbx"
+    assert environment.cwd == "/home/sandbox-agent/work"
+    assert dict(environment.headers) == {}
+    assert tuple(environment.tools) == ("exec_command", "write_stdin", "apply_patch")
+    # Name normalized to the resource form and passed to the launcher.
+    assert environment._argv == (sys.executable, str(_LAUNCHER), "sandboxes/sbx")
+    # Host trailing slash stripped; token derived from the profile (no OpenAI key).
+    assert environment._launch_env == {
+        "DATABRICKS_HOST": "https://my-host.example.com",
+        "DATABRICKS_TOKEN": "tok-abc",
+    }
 
 
-async def test_trust_gateway_ca_false_leaves_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    client = _FakeWorkspaceClient(_FakeProcess())
-    async with databricks_sandbox_environment(
-        workspace_client=cast("WorkspaceClient", client),
-        sandbox_name="sbx",
+def test_factory_accepts_resource_name() -> None:
+    environment = databricks_sandbox_environment(
+        workspace_client=_client(),
+        sandbox_name="sandboxes/sbx",
         cwd="/w",
-        token="t",
-        trust_gateway_ca=False,
-    ):
-        assert "SSL_CERT_FILE" not in os.environ
-    assert "SSL_CERT_FILE" not in os.environ
-
-
-async def test_restores_and_closes_on_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SSL_CERT_FILE", "/orig")
-    client = _FakeWorkspaceClient(_FakeProcess())
-    captured: dict[str, str] = {}
-    with pytest.raises(RuntimeError, match="boom"):
-        async with databricks_sandbox_environment(
-            workspace_client=cast("WorkspaceClient", client),
-            sandbox_name="sbx",
-            cwd="/w",
-            token="t",
-        ) as environment:
-            captured["url"] = environment.url
-            raise RuntimeError("boom")
-
-    assert os.environ["SSL_CERT_FILE"] == "/orig"
-
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    with pytest.raises(OSError):
-        async with connect(captured["url"], ssl=context):
-            pass
-
-
-def test_install_trust_bundle_sets_and_restores(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    import certifi
-
-    ca = tmp_path / "ca.pem"
-    ca.write_bytes(_FAKE_CA)
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-
-    restore = _install_trust_bundle(str(ca))
-    bundle = Path(os.environ["SSL_CERT_FILE"]).read_bytes()
-    assert Path(certifi.where()).read_bytes() in bundle
-    assert _FAKE_CA in bundle
-
-    restore()
-    assert "SSL_CERT_FILE" not in os.environ
-
-
-def test_install_trust_bundle_restores_previous(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    ca = tmp_path / "ca.pem"
-    ca.write_bytes(_FAKE_CA)
-    monkeypatch.setenv("SSL_CERT_FILE", "/x")
-
-    restore = _install_trust_bundle(str(ca))
-    assert os.environ["SSL_CERT_FILE"] != "/x"
-
-    restore()
-    assert os.environ["SSL_CERT_FILE"] == "/x"
-
-
-def test_install_trust_bundle_rejects_concurrent(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    import examples.codex.databricks.environment as env_mod
-
-    ca = tmp_path / "ca.pem"
-    ca.write_bytes(_FAKE_CA)
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-
-    first = _install_trust_bundle(str(ca))
-    bundle_path = os.environ["SSL_CERT_FILE"]
-    try:
-        with pytest.raises(RuntimeError, match="one environment at a time"):
-            _install_trust_bundle(str(ca))
-    finally:
-        first()
-
-    # The guard is released, the bundle is gone, and a fresh install works.
-    assert env_mod._trust_active is False
-    assert not os.path.exists(bundle_path)
-    second = _install_trust_bundle(str(ca))
-    second()
-
-
-def test_install_trust_bundle_rolls_back_on_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    import examples.codex.databricks.environment as env_mod
-
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    with pytest.raises(OSError):
-        _install_trust_bundle(str(tmp_path / "does-not-exist.pem"))
-
-    # The guard is rolled back and no env var leaked, so later calls still work.
-    assert env_mod._trust_active is False
-    assert "SSL_CERT_FILE" not in os.environ
-    ca = tmp_path / "ca.pem"
-    ca.write_bytes(_FAKE_CA)
-    restore = _install_trust_bundle(str(ca))
-    restore()
+    )
+    assert environment.url == "stdio://databricks/sbx"
+    assert environment._argv[-1] == "sandboxes/sbx"

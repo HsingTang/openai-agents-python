@@ -837,8 +837,8 @@ impl EnvironmentOptions {
             ensure!(
                 self.url
                     .as_deref()
-                    .is_some_and(|url| url.starts_with("docker://")),
-                "stdio executor requires a current SDK Docker source"
+                    .is_some_and(|url| url.starts_with("docker://") || url.starts_with("stdio://")),
+                "stdio executor requires a current SDK Docker source or a stdio:// host-owned command"
             );
             Ok(RemoteTransport::Stdio(
                 StdioExecServerCommand {
@@ -2835,6 +2835,58 @@ mod tests {
             manager
                 .get_environment(codex_exec_server::REMOTE_ENVIRONMENT_ID)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn stdio_registration_accepts_host_owned_stdio_scheme() {
+        let options = serde_json::from_value::<super::EnvironmentOptions>(json!({
+            "url": "stdio://host-owned/executor",
+            "cwd": "file:///workspace",
+            "headers": {},
+            "stdio_command": {
+                "program": "codex-missing-exec-server-for-test", "args": [], "env": {}, "cwd": null
+            }
+        }))
+        .expect("decode host options");
+        let manager = codex_core_api::EnvironmentManager::without_environments(
+            codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
+        );
+        options
+            .register(&manager)
+            .expect("register stdio:// host-owned command");
+        assert!(
+            manager
+                .get_environment(codex_exec_server::REMOTE_ENVIRONMENT_ID)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stdio_registration_rejects_unknown_source_scheme() {
+        let options = serde_json::from_value::<super::EnvironmentOptions>(json!({
+            "url": "https://executor.example",
+            "cwd": "file:///workspace",
+            "headers": {},
+            "stdio_command": {
+                "program": "must-not-spawn", "args": [], "env": {}, "cwd": null
+            }
+        }))
+        .expect("decode host options");
+        let manager = codex_core_api::EnvironmentManager::without_environments(
+            codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
+        );
+        let error = options
+            .register(&manager)
+            .err()
+            .expect("reject unknown stdio source scheme");
+        assert_eq!(
+            error.to_string(),
+            "stdio executor requires a current SDK Docker source or a stdio:// host-owned command"
         );
     }
 
