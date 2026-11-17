@@ -67,8 +67,6 @@ SANDBOX_NAME=my-sandbox DATABRICKS_CONFIG_PROFILE=my-workspace \
   PYTHONPATH=. python -m examples.codex.databricks.runner "Inspect the workspace"
 ```
 
-Only the model provider changes; the sandbox, launcher, and tools are identical.
-
 ## Prerequisites
 
 1. **A running sandbox.** The application creates the sandbox (or reuses one),
@@ -80,15 +78,14 @@ Only the model provider changes; the sandbox, launcher, and tools are identical.
    already contains a compatible `codex` binary; for a
    [user-supplied custom image](https://docs.databricks.com/aws/en/compute/serverless/sandbox-custom-image),
    ensure `codex` is installed.
-3. **An SDK build with the host-owned `stdio://` executor source.**
 
 ## Credentials and session lifetime
 
-`DatabricksStdioEnvironment.for_sandbox` captures the workspace token into the environment. With short-lived
-(OAuth / U2M) credentials that token expires (about an hour), so build a fresh
-environment per session rather than reusing one. The launcher forwards the
-exec-server's stderr for diagnostics and returns its exit code, and closes the
-exec-server's stdin on teardown so it shuts down.
+`DatabricksStdioEnvironment.for_sandbox` captures the workspace token into the
+environment. With short-lived (OAuth / U2M) credentials that token expires (about
+an hour), so build a fresh environment per session rather than reusing one. The
+launcher forwards the exec-server's stderr for diagnostics and returns its exit
+code, and closes the exec-server's stdin on teardown so it shuts down.
 
 ## References
 
