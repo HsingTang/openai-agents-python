@@ -2,8 +2,7 @@
 
 Cover ``DatabricksStdioEnvironment`` (native ``stdio_command`` emission and
 url/header validation) and its ``for_sandbox`` constructor (running precondition,
-name normalization, credential derivation, and launcher argv/env wiring). Run
-from the repo root with the preview wheel installed.
+name normalization, credential derivation, and launcher argv/env wiring).
 """
 
 from __future__ import annotations
@@ -15,11 +14,13 @@ from typing import Any
 import pytest
 
 pytest.importorskip("databricks.sdk")
+pytest.importorskip("agents.sandbox")
 
 from databricks.sdk.service.sandbox import SandboxState
 
-from _agents_codex._databricks import _LAUNCHER
 from agents.sandbox import DatabricksStdioEnvironment
+
+_LAUNCHER_MODULE = "_agents_codex._databricks_launcher"
 
 
 class _FakeSandbox:
@@ -49,13 +50,13 @@ def test_to_native_emits_stdio_command() -> None:
         cwd="/home/sandbox-agent/work",
         tools=("exec_command", "write_stdin", "apply_patch"),
         headers={},
-        _argv=("/usr/bin/python", "/pkg/_databricks_launcher.py", "sandboxes/sbx"),
+        _argv=("/usr/bin/python", "-m", _LAUNCHER_MODULE, "sandboxes/sbx"),
         _launch_env={"DATABRICKS_HOST": "https://h", "DATABRICKS_TOKEN": "t"},
     )
     native = environment._to_native()
     assert native["stdio_command"] == {
         "program": "/usr/bin/python",
-        "args": ["/pkg/_databricks_launcher.py", "sandboxes/sbx"],
+        "args": ["-m", _LAUNCHER_MODULE, "sandboxes/sbx"],
         "env": {"DATABRICKS_HOST": "https://h", "DATABRICKS_TOKEN": "t"},
         "cwd": None,
     }
@@ -68,7 +69,7 @@ def test_rejects_non_stdio_url() -> None:
             url="wss://127.0.0.1:9000",
             cwd="/w",
             headers={},
-            _argv=("python", "launch.py", "sandboxes/sbx"),
+            _argv=("python", "-m", _LAUNCHER_MODULE, "sandboxes/sbx"),
         )
 
 
@@ -78,7 +79,7 @@ def test_rejects_headers() -> None:
             url="stdio://databricks/sbx",
             cwd="/w",
             headers={"Authorization": "Bearer x"},
-            _argv=("python", "launch.py", "sandboxes/sbx"),
+            _argv=("python", "-m", _LAUNCHER_MODULE, "sandboxes/sbx"),
         )
 
 
@@ -101,7 +102,7 @@ def test_for_sandbox_wires_launcher_and_credentials() -> None:
     assert environment.cwd == "/home/sandbox-agent/work"
     assert dict(environment.headers) == {}
     assert tuple(environment.tools) == ("exec_command", "write_stdin", "apply_patch")
-    assert environment._argv == (sys.executable, str(_LAUNCHER), "sandboxes/sbx")
+    assert environment._argv == (sys.executable, "-m", _LAUNCHER_MODULE, "sandboxes/sbx")
     assert environment._launch_env == {
         "DATABRICKS_HOST": "https://my-host.example.com",
         "DATABRICKS_TOKEN": "tok-abc",

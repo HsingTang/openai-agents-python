@@ -15,7 +15,6 @@ from __future__ import annotations
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from ._options import RuntimeEnvironment
@@ -23,8 +22,10 @@ from .executor import Environment, ExecutorToolName
 
 _DEFAULT_TOOLS: tuple[ExecutorToolName, ...] = ("exec_command", "write_stdin", "apply_patch")
 
-# The launcher the native runtime spawns to bridge executor stdio to the sandbox.
-_LAUNCHER = Path(__file__).resolve().parent / "_databricks_launcher.py"
+# The launcher module the native runtime spawns (as ``python -m``) to bridge
+# executor stdio to the sandbox. A light module with no native imports, so the
+# spawned interpreter does not load the runtime.
+_LAUNCHER_MODULE = "_agents_codex._databricks_launcher"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -73,6 +74,11 @@ class DatabricksStdioEnvironment(Environment[object]):
         launcher to authenticate with. Lifecycle (create / start / poll until
         running) is the caller's responsibility; this only checks the state.
 
+        The derived token is captured into the returned environment. With
+        short-lived (OAuth / U2M) credentials it expires (about an hour), so
+        build a fresh environment per session rather than reusing one across
+        sessions or long-lived turns.
+
         Args:
             workspace_client: An authenticated ``databricks.sdk.WorkspaceClient``.
             sandbox_name: An existing, running sandbox, as the bare id or the
@@ -106,6 +112,6 @@ class DatabricksStdioEnvironment(Environment[object]):
             cwd=cwd,
             tools=tuple(tools),
             headers={},
-            _argv=(sys.executable, str(_LAUNCHER), name),
+            _argv=(sys.executable, "-m", _LAUNCHER_MODULE, name),
             _launch_env={"DATABRICKS_HOST": host, "DATABRICKS_TOKEN": token},
         )

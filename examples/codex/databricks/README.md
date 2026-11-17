@@ -101,19 +101,27 @@ Only the model provider changes; the sandbox, launcher, and tools are identical.
 
 ## Tests
 
-`tests/codex/test_databricks_environment.py` and `test_databricks_launcher.py`
-cover the `stdio_command` emission, the `stdio://` / header validation, the
-factory's running-sandbox precondition, name normalization, and credential and
-launcher-argv wiring, plus the launcher's startup-banner filter. They exercise
-only the Python layer (not the native admission or a live sandbox), but they
-import the packaged class, so run them against an SDK built from this branch.
-Install that wheel, this example's requirements, and `pytest`, then run them
-explicitly from the repo root (the default `testpaths`
-does not include `tests/codex`):
+`packages/codex/tests/test_databricks_environment.py` and
+`test_databricks_launcher.py` cover the `stdio_command` emission, the `stdio://`
+/ header validation, the `for_sandbox` precondition and credential/launcher-argv
+wiring, and the launcher's banner filter, credential guard, protocol forwarding,
+and exit-code handling. They are in the default `testpaths`, so the normal suite
+runs them:
 
 ```sh
-pytest tests/codex
+pytest packages/codex/tests/test_databricks_environment.py packages/codex/tests/test_databricks_launcher.py
 ```
 
-The native admission change (`stdio://`) is covered by Rust unit tests in
+The environment tests skip without `databricks-sdk` and the `[classic]` extra
+installed; the launcher tests run with neither. They exercise the Python layer
+only - the native `stdio://` admission is covered by Rust unit tests in
 `packages/codex/rust/environment.rs` and qualified by the native build.
+
+## Credentials and session lifetime
+
+`for_sandbox` captures the workspace token into the environment. With short-lived
+(OAuth / U2M) credentials that token expires (about an hour), so build a fresh
+environment per session rather than reusing one; `runner.py` does this. The
+launcher forwards the exec-server's stderr for diagnostics and returns its exit
+code, and closes the exec-server's stdin on teardown so it shuts down (a lingering
+one is reaped by the sandbox's inactivity timeout).
