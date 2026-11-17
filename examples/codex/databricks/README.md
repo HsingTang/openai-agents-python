@@ -1,13 +1,13 @@
 # Databricks sandbox executor
 
-Back a native `Environment` with a Databricks sandbox, so an agent driven by
-this SDK runs `exec_command` / `write_stdin` / `apply_patch` inside the sandbox.
-This is the "remote execution" pattern from `docs/sdk/execution.md`, built the
-same way the SDK's own Docker support is: `agents.sandbox.DatabricksStdioEnvironment`
-is an `Environment` subclass that declares a host-owned `stdio_command` the
-native runtime spawns, and the runtime speaks the exec-server protocol over that
-process's stdin/stdout. It is the Databricks counterpart of
-`agents.sandbox.DockerGateway`.
+Run an agent driven by this SDK with its `exec_command` / `write_stdin` /
+`apply_patch` tools executing inside a Databricks sandbox.
+`agents.sandbox.DatabricksStdioEnvironment` is the first-class `Environment`
+subclass that does this - the "remote execution" pattern from
+`docs/sdk/execution.md`, built the same way the SDK's own Docker support is: it
+declares a host-owned `stdio_command` the native runtime spawns, and the runtime
+speaks the exec-server protocol over that process's stdin/stdout. It is the
+Databricks counterpart of `agents.sandbox.DockerGateway`.
 
 > **Status.** The stdio transport and the full turn are validated end-to-end
 > against a live Databricks sandbox on the `0.24.0-alpha.8` preview wheel: a real
@@ -18,7 +18,7 @@ process's stdin/stdout. It is the Databricks counterpart of
 > native runtime (`packages/codex/rust/environment.rs`); it is not yet in a
 > released preview wheel. Until it ships, build the SDK from this branch (see
 > `packages/codex/MAINTAINING.md`). The Python pieces are covered by
-> `tests/codex/` against the released wheel.
+> `packages/codex/tests/` against the released wheel.
 
 ## How it works
 
@@ -30,7 +30,7 @@ the native runtime spawns that launcher and speaks the exec-server wire protocol
 over its stdin/stdout. The launcher relays that protocol to `codex exec-server
 --listen stdio` inside the sandbox over the `databricks-sdk` streaming command
 API (`WorkspaceClient.sandbox.execute_command`, whose `CommandProcess` exposes the
-command's `stdin`, `stdout` and exit). It does not parse the protocol; it only
+command's `stdin`, `stdout`, `stderr` and exit). It does not parse the protocol; it only
 drops a startup banner the sandbox's `codex` prints on stdout before the protocol
 begins (non-JSON lines) so it never reaches the runtime as a bogus message.
 
@@ -38,8 +38,8 @@ Because the runtime owns the launcher process and talks to it over ordinary
 pipes, there is no WebSocket gateway, no TLS termination, and no shared-secret
 handshake. `execute_command` reaches the sandbox outbound through the Databricks
 control plane, so the sandbox needs no inbound ingress. The agent loop runs in
-your process (via `NativeProvider`), which is what makes the `Environment`
-approval / transform callbacks and `NetworkPolicy` available.
+your process (via `NativeProvider`), so the `Environment` approval / transform
+callbacks and `NetworkPolicy` stay available.
 
 ## Files
 
@@ -48,12 +48,13 @@ approval / transform callbacks and `NetworkPolicy` available.
 
 ## Install and run
 
-The v1.0 SDK is a GitHub preview wheel (off PyPI). It ships a compiled native
-runtime, so it needs a supported host: **Linux x86_64 with glibc 2.28 or newer**,
+The SDK is distributed as a GitHub preview wheel (off PyPI). It ships a compiled
+native runtime, so it needs a supported host: **Linux x86_64 with glibc 2.28 or newer**,
 macOS arm64, or Windows x64. This example additionally needs the host-owned
 `stdio://` executor source (see **Status** above), so build the SDK from this
 branch per `packages/codex/MAINTAINING.md` until that change is in a released
-wheel. Then install this example's requirements:
+wheel. Install it with the `[classic]` extra (`openai-agents[classic]`). Then
+install this example's requirements:
 
 ```sh
 pip install -r examples/codex/databricks/requirements.txt
@@ -112,9 +113,11 @@ runs them:
 pytest packages/codex/tests/test_databricks_environment.py packages/codex/tests/test_databricks_launcher.py
 ```
 
-The environment tests skip without `databricks-sdk` and the `[classic]` extra
-installed; the launcher tests run with neither. They exercise the Python layer
-only - the native `stdio://` admission is covered by Rust unit tests in
+Both test modules run without `databricks-sdk` or the `[classic]` extra -
+`for_sandbox`'s lazy `databricks.sdk` import is satisfied with an injected fake -
+except one assertion that imports `agents.sandbox` and is skipped unless
+`[classic]` is installed. They exercise the Python layer only; the native
+`stdio://` admission is covered by Rust unit tests in
 `packages/codex/rust/environment.rs` and qualified by the native build.
 
 ## Credentials and session lifetime
