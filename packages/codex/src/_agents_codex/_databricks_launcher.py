@@ -82,6 +82,18 @@ def _pump_stderr(process: Any) -> None:
         pass
 
 
+def _terminate(process: Any, done: threading.Event) -> None:
+    """Shut the exec-server down and release the relay on session close/cancellation.
+
+    Sets ``done`` so the main loop always returns, even if closing the stream does
+    not unblock a pending read; the daemon relay thread is then abandoned.
+    """
+    _close_stdin(process)
+    with suppress(Exception):
+        process.close()
+    done.set()
+
+
 def _run(process: Any, *, install_signals: bool = True) -> int:
     """Relay the exec-server protocol over this process's stdio; return its exit code."""
     done = threading.Event()
@@ -92,16 +104,14 @@ def _run(process: Any, *, install_signals: bool = True) -> int:
         finally:
             done.set()
 
-    def terminate(*_args: object) -> None:
-        # Session close / cancellation: shut the exec-server down and unblock the relay.
-        _close_stdin(process)
-        with suppress(Exception):
-            process.close()
-
     if install_signals:
+
+        def handler(*_args: object) -> None:
+            _terminate(process, done)
+
         for sig in (signal.SIGTERM, signal.SIGINT):
             with suppress(ValueError, OSError):
-                signal.signal(sig, terminate)
+                signal.signal(sig, handler)
 
     threading.Thread(target=_pump_stdin, args=(process,), daemon=True).start()
     threading.Thread(target=_pump_stderr, args=(process,), daemon=True).start()
