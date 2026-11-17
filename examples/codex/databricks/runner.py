@@ -3,10 +3,10 @@
 Prerequisites (see README.md):
   - the SDK preview wheel plus this example's requirements.txt
   - a Databricks sandbox whose image carries the ``codex`` exec-server
-  - Databricks auth (a CLI profile)
+  - Databricks auth (a .databrickscfg profile)
 
 Environment variables:
-  DATABRICKS_CONFIG_PROFILE     Databricks CLI profile (default: DEFAULT)
+  DATABRICKS_CONFIG_PROFILE     .databrickscfg profile name (default: DEFAULT)
   SANDBOX_NAME                  sandbox id or ``sandboxes/<id>`` resource name (required)
   SANDBOX_CWD                   remote workspace path (default: /home/sandbox-agent/work)
   SANDBOX_CREATE                "1" to provision the sandbox if absent (default: off)
@@ -32,7 +32,7 @@ OpenAI key is required. Set OPENAI_BASE_URL / OPENAI_API_KEY to use a different
 provider (for example OpenAI directly).
 
 Run:
-    SANDBOX_NAME=openai-agent-sandbox DATABRICKS_CONFIG_PROFILE=my-workspace \
+    SANDBOX_NAME=my-sandbox DATABRICKS_CONFIG_PROFILE=my-workspace \
       PYTHONPATH=. python -m examples.codex.databricks.runner "Inspect the project"
 """
 

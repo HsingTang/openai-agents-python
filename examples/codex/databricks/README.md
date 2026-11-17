@@ -2,70 +2,52 @@
 
 Run an agent driven by this SDK with its `exec_command` / `write_stdin` /
 `apply_patch` tools executing inside a Databricks sandbox.
-`agents.sandbox.DatabricksStdioEnvironment` is the first-class `Environment`
-subclass that does this - the "remote execution" pattern from
-`docs/sdk/execution.md`, built the same way the SDK's own Docker support is: it
-declares a host-owned `stdio_command` the native runtime spawns, and the runtime
-speaks the exec-server protocol over that process's stdin/stdout. It is the
-Databricks counterpart of `agents.sandbox.DockerGateway`.
+`agents.sandbox.DatabricksStdioEnvironment` is the first-class `Environment` for
+this - the Databricks counterpart of `agents.sandbox.DockerGateway`, following
+the SDK's "remote execution" pattern (`docs/sdk/execution.md`).
 
-> **Status.** The stdio transport and the full turn are validated end-to-end
-> against a live Databricks sandbox on the `0.24.0-alpha.8` preview wheel: a real
-> `codex exec-server` ran the agent's tool call in the sandbox with no gateway
-> server and no TLS, driven over the `databricks-sdk` streaming command API, for
-> both model providers (Databricks AI Gateway and OpenAI direct). The `stdio://`
-> executor source requires the host-owned stdio admission change in this PR's
-> native runtime (`packages/codex/rust/environment.rs`); it is not yet in a
-> released preview wheel. Until it ships, build the SDK from this branch (see
-> `packages/codex/MAINTAINING.md`). The Python pieces are covered by
-> `packages/codex/tests/` against the released wheel.
+## Usage example
 
-## How it works
+```python
+from databricks.sdk import WorkspaceClient
+from agents import Agent, NativeProvider
+from agents.sandbox import DatabricksStdioEnvironment
 
-`DatabricksStdioEnvironment.for_sandbox(...)` confirms the sandbox is running,
-derives the workspace host and token from the `WorkspaceClient`, and returns an
-environment to hand to `agent.session(environment=...)`. The environment emits a
-`stdio_command`: the argv of a local launcher process. When the session opens,
-the native runtime spawns that launcher and speaks the exec-server wire protocol
-over its stdin/stdout. The launcher relays that protocol to `codex exec-server
---listen stdio` inside the sandbox over the `databricks-sdk` streaming command
-API (`WorkspaceClient.sandbox.execute_command`, whose `CommandProcess` exposes the
-command's `stdin`, `stdout`, `stderr` and exit). It does not parse the protocol; it only
-drops a startup banner the sandbox's `codex` prints on stdout before the protocol
-begins (non-JSON lines) so it never reaches the runtime as a bogus message.
+w = WorkspaceClient(profile="my-workspace")
+# Provision "my-sandbox" (create_sandbox + poll until running); see runner.py.
 
-Because the runtime owns the launcher process and talks to it over ordinary
-pipes, there is no WebSocket gateway, no TLS termination, and no shared-secret
-handshake. `execute_command` reaches the sandbox outbound through the Databricks
-control plane, so the sandbox needs no inbound ingress. The agent loop runs in
-your process (via `NativeProvider`), so the `Environment` approval / transform
-callbacks and `NetworkPolicy` stay available.
+environment = DatabricksStdioEnvironment.for_sandbox(
+    workspace_client=w,
+    sandbox_name="my-sandbox",
+    cwd="/home/sandbox-agent/work",
+)
+async with NativeProvider(
+    base_url="https://<workspace-host>/ai-gateway/codex/v1",
+    api_key=w.config.authenticate()["Authorization"].removeprefix("Bearer "),
+    supports_websockets=False,
+) as provider:
+    agent = Agent(model="gpt-5.5", provider=provider, instructions="...")
+    async with agent.session(environment=environment) as session:
+        result = await (await session.submit("Inspect the workspace")).get_result()
+        print(result.final_output)
+```
 
-## Files
-
-- `runner.py` - a runnable end-to-end example. The environment itself is the
-  first-class `agents.sandbox.DatabricksStdioEnvironment`.
-
-## Install and run
+## Install and run the example
 
 The SDK is distributed as a GitHub preview wheel (off PyPI). It ships a compiled
 native runtime, so it needs a supported host: **Linux x86_64 with glibc 2.28 or newer**,
-macOS arm64, or Windows x64. This example additionally needs the host-owned
-`stdio://` executor source (see **Status** above), so build the SDK from this
-branch per `packages/codex/MAINTAINING.md` until that change is in a released
-wheel. Install it with the `[classic]` extra (`openai-agents[classic]`). Then
-install this example's requirements:
+macOS arm64, or Windows x64.
 
 ```sh
 pip install -r examples/codex/databricks/requirements.txt
 ```
 
-Provide Databricks auth (a CLI profile) and run from the repo root. The model
-runs through the workspace's Databricks AI Gateway by default, using the
-profile's own token, so no OpenAI key is needed:
+Provide Databricks auth (a `.databrickscfg` profile), then run the example script
+`runner.py` from the repo root. The model runs through the workspace's Databricks
+AI Gateway by default, using the profile's own token, so no OpenAI key is needed:
 
 ```sh
-SANDBOX_NAME=openai-agent-sandbox DATABRICKS_CONFIG_PROFILE=my-workspace \
+SANDBOX_NAME=my-sandbox DATABRICKS_CONFIG_PROFILE=my-workspace \
   PYTHONPATH=. python -m examples.codex.databricks.runner "Inspect the workspace"
 ```
 
@@ -79,7 +61,7 @@ set `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and an OpenAI model id your account can
 use:
 
 ```sh
-SANDBOX_NAME=openai-agent-sandbox DATABRICKS_CONFIG_PROFILE=my-workspace \
+SANDBOX_NAME=my-sandbox DATABRICKS_CONFIG_PROFILE=my-workspace \
   OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_API_KEY=sk-... \
   OPENAI_MODEL=gpt-5.3-codex \
   PYTHONPATH=. python -m examples.codex.databricks.runner "Inspect the workspace"
@@ -92,39 +74,23 @@ Only the model provider changes; the sandbox, launcher, and tools are identical.
 1. **A running sandbox.** The application creates the sandbox (or reuses one),
    starts it if stopped, and polls its status until running before opening the
    environment - the exec-server is reached through `execute_command`, which
-   needs a running sandbox. `runner.py` shows this, and
-   `DatabricksStdioEnvironment.for_sandbox` confirms it.
-2. **exec-server stdio mode in the image.** The sandbox's `codex` runs the
-   standalone exec-server over stdio with `codex exec-server --listen stdio`,
-   which the launcher relays.
-3. **An SDK build with the host-owned `stdio://` executor source** (see
-   **Status**).
-
-## Tests
-
-`packages/codex/tests/test_databricks_environment.py` and
-`test_databricks_launcher.py` cover the `stdio_command` emission, the `stdio://`
-/ header validation, the `for_sandbox` precondition and credential/launcher-argv
-wiring, and the launcher's banner filter, credential guard, protocol forwarding,
-and exit-code handling. They are in the default `testpaths`, so the normal suite
-runs them:
-
-```sh
-pytest packages/codex/tests/test_databricks_environment.py packages/codex/tests/test_databricks_launcher.py
-```
-
-Both test modules run without `databricks-sdk` or the `[classic]` extra -
-`for_sandbox`'s lazy `databricks.sdk` import is satisfied with an injected fake -
-except one assertion that imports `agents.sandbox` and is skipped unless
-`[classic]` is installed. They exercise the Python layer only; the native
-`stdio://` admission is covered by Rust unit tests in
-`packages/codex/rust/environment.rs` and qualified by the native build.
+   needs a running sandbox.
+2. **A `codex` binary in the sandbox image.** The launcher runs
+   `codex exec-server --listen stdio` in the sandbox. The default sandbox image
+   already contains a compatible `codex` binary; for a
+   [user-supplied custom image](https://docs.databricks.com/aws/en/compute/serverless/sandbox-custom-image),
+   ensure `codex` is installed.
+3. **An SDK build with the host-owned `stdio://` executor source.**
 
 ## Credentials and session lifetime
 
-`for_sandbox` captures the workspace token into the environment. With short-lived
+`DatabricksStdioEnvironment.for_sandbox` captures the workspace token into the environment. With short-lived
 (OAuth / U2M) credentials that token expires (about an hour), so build a fresh
-environment per session rather than reusing one; `runner.py` does this. The
-launcher forwards the exec-server's stderr for diagnostics and returns its exit
-code, and closes the exec-server's stdin on teardown so it shuts down (a lingering
-one is reaped by the sandbox's inactivity timeout).
+environment per session rather than reusing one. The launcher forwards the
+exec-server's stderr for diagnostics and returns its exit code, and closes the
+exec-server's stdin on teardown so it shuts down.
+
+## References
+
+- [Databricks Sandbox documentation](https://docs.databricks.com/aws/en/compute/serverless/sandbox)
+- [Sandbox SDK on databricks-sdk for Python](https://databricks-sdk-py.readthedocs.io/en/latest/workspace/sandbox/sandbox.html)
