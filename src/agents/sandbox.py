@@ -7,6 +7,7 @@ from _agents_codex.sandbox import (
     BoxMount as BoxMount,
     CallbackSink as CallbackSink,
     ChainedSink as ChainedSink,
+    DatabricksStdioEnvironment as DatabricksStdioEnvironment,
     Dir as Dir,
     DockerGateway as DockerGateway,
     DockerVolumeMountStrategy as DockerVolumeMountStrategy,
@@ -69,6 +70,7 @@ from _agents_codex.sandbox import (
 )
 
 __all__ = [
+    "DatabricksStdioEnvironment",
     "DockerGateway",
     "Skill",
     "Skills",
