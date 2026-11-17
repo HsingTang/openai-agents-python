@@ -9,14 +9,15 @@ Environment variables:
   DATABRICKS_CONFIG_PROFILE     .databrickscfg profile name (default: DEFAULT)
   SANDBOX_NAME                  sandbox id or ``sandboxes/<id>`` resource name (required)
   SANDBOX_CWD                   remote workspace path (default: /home/sandbox-agent/work)
-  SANDBOX_CREATE                "1" to provision the sandbox if absent (default: off)
+  SANDBOX_CREATE                "1" to create the sandbox before running (default: off)
   SANDBOX_IMAGE                 image with the codex exec-server (used when creating)
   SANDBOX_INACTIVITY_TIMEOUT_S  auto-stop timeout in seconds (default: 900)
   OPENAI_MODEL                  model name (default: gpt-5.5)
-  OPENAI_BASE_URL               model-provider base URL (default: the workspace's
-                                Databricks AI Gateway codex endpoint)
-  OPENAI_API_KEY                model-provider key (default: a token minted from the
-                                Databricks profile, so no OpenAI key is needed)
+  OPENAI_BASE_URL               model-provider base URL, set together with
+                                OPENAI_API_KEY (default: the Databricks AI Gateway
+                                codex endpoint)
+  OPENAI_API_KEY                model-provider key, set together with OPENAI_BASE_URL
+                                (default: a token minted from the Databricks profile)
 
 With SANDBOX_CREATE=1 the runner provisions the sandbox. In all cases it then
 confirms the sandbox is running (starting it if stopped and polling until ready)
@@ -28,8 +29,8 @@ needed here. A sandbox that auto-stops is started again before the next session.
 
 By default the model runs through the sandbox workspace's Databricks AI Gateway
 codex endpoint, authenticated with the profile's own token (PAT or OAuth), so no
-OpenAI key is required. Set OPENAI_BASE_URL / OPENAI_API_KEY to use a different
-provider (for example OpenAI directly).
+OpenAI key is required. To use a different provider (for example OpenAI directly),
+set OPENAI_BASE_URL and OPENAI_API_KEY together; setting only one is rejected.
 
 Run:
     SANDBOX_NAME=my-sandbox DATABRICKS_CONFIG_PROFILE=my-workspace \
@@ -105,17 +106,21 @@ def _wait_until_running(
 def _model_credentials(workspace_client: WorkspaceClient) -> tuple[str, str]:
     """Return ``(base_url, api_key)`` for ``NativeProvider``.
 
-    Defaults to the workspace's Databricks AI Gateway codex endpoint, with a
-    token minted from the Databricks profile (PAT or OAuth) - no OpenAI key
-    needed. Override with OPENAI_BASE_URL / OPENAI_API_KEY for another provider.
+    With neither OPENAI_BASE_URL nor OPENAI_API_KEY set, defaults to the
+    workspace's Databricks AI Gateway codex endpoint with a token minted from the
+    Databricks profile (PAT or OAuth) - no OpenAI key needed. To use another
+    provider (for example OpenAI directly), set both. Setting only one is rejected
+    so a key is never sent to the wrong endpoint.
     """
-    host = (workspace_client.config.host or "").rstrip("/")
-    base_url = os.getenv("OPENAI_BASE_URL") or f"{host}/ai-gateway/codex/v1"
+    base_url = os.getenv("OPENAI_BASE_URL")
     api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        authorization = workspace_client.config.authenticate().get("Authorization", "")
-        api_key = authorization.removeprefix("Bearer ").strip()
-    return base_url, api_key
+    if bool(base_url) != bool(api_key):
+        raise ValueError("set OPENAI_BASE_URL and OPENAI_API_KEY together, or neither")
+    if base_url and api_key:
+        return base_url, api_key
+    host = (workspace_client.config.host or "").rstrip("/")
+    authorization = workspace_client.config.authenticate().get("Authorization", "")
+    return f"{host}/ai-gateway/codex/v1", authorization.removeprefix("Bearer ").strip()
 
 
 async def main(task: str) -> None:

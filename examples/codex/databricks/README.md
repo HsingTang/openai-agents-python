@@ -57,8 +57,8 @@ launcher starts `exec-server` on each session; it is killed when the sandbox
 stops and relaunched on the next session.
 
 To run the model through OpenAI directly instead of the Databricks AI Gateway,
-set `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and an OpenAI model id your account can
-use:
+set `OPENAI_BASE_URL` and `OPENAI_API_KEY` together (set both or neither), plus an
+OpenAI model id your account can use:
 
 ```sh
 SANDBOX_NAME=my-sandbox DATABRICKS_CONFIG_PROFILE=my-workspace \
